@@ -21,50 +21,106 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
 
+// Envolve os handlers async para que qualquer erro (ex.: banco fora do ar)
+// caia no middleware de erro em vez de derrubar o processo.
+function wrap(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/api/tasks", async (req, res) => {
-  const [rows] = await pool.query(
-    "SELECT id, title, completed, created_at FROM tasks ORDER BY id DESC"
-  );
-  res.json(rows);
-});
+app.get(
+  "/api/tasks",
+  wrap(async (req, res) => {
+    const [rows] = await pool.query(
+      "SELECT id, title, completed, created_at FROM tasks ORDER BY id DESC"
+    );
+    res.json(rows);
+  })
+);
 
-app.post("/api/tasks", async (req, res) => {
-  const { title } = req.body;
+app.post(
+  "/api/tasks",
+  wrap(async (req, res) => {
+    const { title } = req.body;
 
-  if (!title || !title.trim()) {
-    return res.status(400).json({ error: "Titulo da tarefa e obrigatorio." });
-  }
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: "Titulo da tarefa e obrigatorio." });
+    }
 
-  const [result] = await pool.query(
-    "INSERT INTO tasks (title, completed) VALUES (?, false)",
-    [title.trim()]
-  );
+    const [result] = await pool.query(
+      "INSERT INTO tasks (title, completed) VALUES (?, false)",
+      [title.trim()]
+    );
 
-  res.status(201).json({ id: result.insertId, title: title.trim(), completed: false });
-});
+    const [rows] = await pool.query(
+      "SELECT id, title, completed, created_at FROM tasks WHERE id = ?",
+      [result.insertId]
+    );
 
-app.put("/api/tasks/:id", async (req, res) => {
-  const { id } = req.params;
-  const { title, completed } = req.body;
+    res.status(201).json(rows[0]);
+  })
+);
 
-  await pool.query(
-    "UPDATE tasks SET title = COALESCE(?, title), completed = COALESCE(?, completed) WHERE id = ?",
-    [title || null, typeof completed === "boolean" ? completed : null, id]
-  );
+app.put(
+  "/api/tasks/:id",
+  wrap(async (req, res) => {
+    const { id } = req.params;
+    const { title, completed } = req.body;
 
-  res.json({ id: Number(id), title, completed });
-});
+    if (title !== undefined && !String(title).trim()) {
+      return res.status(400).json({ error: "Titulo da tarefa nao pode ser vazio." });
+    }
 
-app.delete("/api/tasks/:id", async (req, res) => {
-  await pool.query("DELETE FROM tasks WHERE id = ?", [req.params.id]);
-  res.status(204).send();
+    if (completed !== undefined && typeof completed !== "boolean") {
+      return res.status(400).json({ error: "Campo completed deve ser booleano." });
+    }
+
+    if (title === undefined && completed === undefined) {
+      return res.status(400).json({ error: "Informe title e/ou completed." });
+    }
+
+    await pool.query(
+      "UPDATE tasks SET title = COALESCE(?, title), completed = COALESCE(?, completed) WHERE id = ?",
+      [title !== undefined ? String(title).trim() : null, completed !== undefined ? completed : null, id]
+    );
+
+    // Checa existencia pelo SELECT, e nao por affectedRows: um UPDATE que nao
+    // altera valor nenhum retorna affectedRows = 0 mesmo com a tarefa existindo.
+    const [rows] = await pool.query(
+      "SELECT id, title, completed, created_at FROM tasks WHERE id = ?",
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Tarefa nao encontrada." });
+    }
+
+    res.json(rows[0]);
+  })
+);
+
+app.delete(
+  "/api/tasks/:id",
+  wrap(async (req, res) => {
+    const [result] = await pool.query("DELETE FROM tasks WHERE id = ?", [req.params.id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Tarefa nao encontrada." });
+    }
+
+    res.status(204).send();
+  })
+);
+
+// Middleware de erro: responde JSON em vez de vazar stack trace HTML.
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "Erro interno ao acessar o banco de dados." });
 });
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`Task Manager rodando na porta ${port}`);
 });
-
